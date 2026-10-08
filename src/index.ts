@@ -817,18 +817,154 @@ function sliceSection(text: string, heading: RegExp, next: RegExp): string | nul
  * hundred statutes.
  *
  * Honest upstream: an unknown chapter returns 404.
+ *
+ * LATENCY / CACHE (fleet #2829): a third external catalog review measured
+ * ~20s reported latency here. AE over the 7 days to 2026-10-08 showed why:
+ * 166 of 172 or_revised_statute calls (96.5%) came back status 500 at an
+ * average 18,986ms — only 6 calls succeeded, averaging 2,509ms. Reproduced
+ * live: `or_revised_statute({section:"163.125"})` → "Oregon Legislature
+ * returned HTTP 522 for 163.125" at 21.1s wall clock. HTTP 522 is
+ * Cloudflare's own "connection to origin timed out" —
+ * www.oregonlegislature.gov sits behind Cloudflare, and almost every real
+ * call is hitting an origin CF cannot reach within its own ~19-20s window.
+ * Nothing we do changes that origin's reliability, so the fix has two parts:
+ *   1. Cache a successfully-fetched CHAPTER page in KV (injected as
+ *      `_cacheKv`, the gateway's shared IDENTITY_KV — same binding and
+ *      pattern as spain-tenders' injectCacheKv, fleet #2769), keyed on the
+ *      chapter URL rather than caller args, so once ANY caller gets a
+ *      chapter through, every later lookup of ANY section in that same
+ *      chapter — including ones that land during an outage — is served
+ *      from KV in well under 100ms instead of waiting out another ~20s
+ *      failure. The chapter-level key is a deliberately wider net than
+ *      wisconsin-code's per-section one: one successful fetch of ors163.html
+ *      now serves every section of chapter 163, not just the one that
+ *      happened to get through.
+ *   2. Bound the live fetch to 10s instead of the shared 25s default
+ *      (DEFAULT_FETCH_TIMEOUT_MS): the 6 real successes observed over 7 days
+ *      landed under ~2.5s, and the natural upstream failure arrives around
+ *      19-20s, so 10s cannot cut off a genuine answer — it only halves the
+ *      wait for the overwhelming majority of calls that were always going
+ *      to fail anyway.
+ * A true miss (never cached, live fetch fails) stays exactly the loud
+ * `upstream_down`-classified error it always was — never a silent empty
+ * result.
  */
-
-// Bound every fetch() in this pack to a fixed timeout — an upstream that
-// degrades without erroring would otherwise hold the Worker in `await fetch()`
-// until its own execution budget kills the request (minutes, not seconds).
-// Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
-async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'Oregon Revised Statutes');
-}
 
 const BASE = 'https://www.oregonlegislature.gov/bills_laws/ors/ors';
 const UA = 'pipeworx-mcp-oregon-code/1.0 (+https://pipeworx.io)';
+
+// See the module comment above (fleet #2829) for why this is 10s rather than
+// the shared 25s default: the upstream's own ~19-20s failure window is what
+// made the uncached path slow, not a lack of patience on our side.
+const LIVE_FETCH_TIMEOUT_MS = 10_000;
+
+// -- chapter-page cache (KV, injected as _cacheKv) ---------------------------
+interface KvLike {
+  get(key: string, type: 'json'): Promise<unknown>;
+  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+}
+
+interface CachedPage {
+  cachedAt: number; // epoch ms this page was last fetched live
+  text: string;     // already run through statuteText() — stored post-strip
+}
+
+type CacheMeta = {
+  stale: boolean;
+  cacheAgeSec: number;
+  servedFrom: 'fresh-cache' | 'stale-cache' | 'upstream';
+};
+
+const CACHE_KEY_PREFIX = 'oregon_code:page:';
+// Statute text changes only when a session acts on a bill — not daily — so a
+// day-old copy is still correct essentially always.
+const FRESH_SEC = 24 * 60 * 60;
+// Past the fresh window, keep answering from the last fetch as a fallback
+// (flagged stale) for up to 13 more days before giving up and going loud —
+// a stale but correct statute beats a timeout for a caller doing legal
+// research.
+const STALE_MAX_SEC = 13 * 24 * 60 * 60;
+const KV_RETENTION_SEC = 20 * 24 * 60 * 60;
+
+function kvFromArgs(args: Record<string, unknown>): KvLike | undefined {
+  const kv = args._cacheKv;
+  return kv && typeof (kv as KvLike).get === 'function' && typeof (kv as KvLike).put === 'function'
+    ? (kv as KvLike)
+    : undefined;
+}
+
+// One upstream fetch per chapter in flight at a time within this isolate —
+// a burst of concurrent callers all missing the KV cache (or several
+// sections of the SAME chapter in one burst) pays the cold fetch once, not
+// once per caller.
+const INFLIGHT = new Map<string, Promise<{ status: number; text: string }>>();
+
+async function fetchChapterLive(url: string, raw: string): Promise<{ status: number; text: string }> {
+  const res = await fetchWithTimeout(
+    url, { headers: { 'User-Agent': UA } }, 'Oregon Revised Statutes', LIVE_FETCH_TIMEOUT_MS,
+  );
+  if (res.status === 404) return { status: 404, text: '' };
+  if (!res.ok) throw new Error(`Oregon Legislature returned HTTP ${res.status} for ${raw}`);
+  return { status: 200, text: statuteText(await readStatuteResponse(res)) };
+}
+
+// Cache-first wrapper (fleet #2829):
+//   1. Fresh KV hit — answer with ZERO upstream fetch.
+//   2. Miss/stale — fetch upstream (de-duped per isolate via INFLIGHT), then
+//      write the fresh copy to KV.
+//   3. Upstream fetch fails — serve a still-usable KV copy (< STALE_MAX_SEC
+//      past its freshness window) flagged `stale: true`, rather than
+//      failing the call.
+//   4. No cache at all and upstream fails — rethrow. A true miss stays a
+//      loud `upstream_down`-classified error, never a silent empty result.
+async function fetchChapterPage(
+  url: string, chapter: string, raw: string, kv: KvLike | undefined,
+): Promise<{ status: 404 } | { status: 200; text: string; cache: CacheMeta }> {
+  const key = CACHE_KEY_PREFIX + chapter;
+  const now = Date.now();
+
+  let cached: CachedPage | null = null;
+  if (kv) {
+    try {
+      cached = (await kv.get(key, 'json')) as CachedPage | null;
+    } catch {
+      cached = null; // caching is an optimization; a KV read failure must not fail the call
+    }
+  }
+  const cacheAgeSec = cached ? Math.max(0, Math.round((now - cached.cachedAt) / 1000)) : null;
+
+  if (cached && cacheAgeSec !== null && cacheAgeSec < FRESH_SEC) {
+    return { status: 200, text: cached.text, cache: { stale: false, cacheAgeSec, servedFrom: 'fresh-cache' } };
+  }
+
+  let flight = INFLIGHT.get(key);
+  if (!flight) {
+    flight = fetchChapterLive(url, raw).finally(() => INFLIGHT.delete(key));
+    INFLIGHT.set(key, flight);
+  }
+
+  try {
+    const fresh = await flight;
+    if (fresh.status === 404) return { status: 404 };
+    if (kv) {
+      kv.put(key, JSON.stringify({ cachedAt: now, text: fresh.text } satisfies CachedPage), {
+        expirationTtl: KV_RETENTION_SEC,
+      }).catch(() => {
+        /* best-effort; a write failure must not fail an otherwise-successful live fetch */
+      });
+    }
+    return { status: 200, text: fresh.text, cache: { stale: false, cacheAgeSec: 0, servedFrom: 'upstream' } };
+  } catch (e) {
+    if (cached && cacheAgeSec !== null && cacheAgeSec < FRESH_SEC + STALE_MAX_SEC) {
+      return { status: 200, text: cached.text, cache: { stale: true, cacheAgeSec, servedFrom: 'stale-cache' } };
+    }
+    throw e;
+  }
+}
+
+function dataAsOf(meta: CacheMeta): string {
+  return new Date(Date.now() - meta.cacheAgeSec * 1000).toISOString();
+}
 
 const tools: McpToolExport['tools'] = [{
   name: 'or_revised_statute',
@@ -854,15 +990,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   }
   const chapter = m[1];
   const url = `${BASE}${chapter}.html`;
-  const res = await pwFetch(url, { headers: { 'User-Agent': UA } });
-  if (res.status === 404) {
+  const page = await fetchChapterPage(url, chapter, raw, kvFromArgs(args));
+  if (page.status === 404) {
     return { found: false, reason: 'chapter_not_found', section: raw, chapter,
       message: `No chapter ${chapter} in the Oregon Revised Statutes (HTTP 404).`,
       hint: 'Chapter numbers are not contiguous — repealed chapters are normal.' };
   }
-  if (!res.ok) throw new Error(`Oregon Legislature returned HTTP ${res.status} for ${raw}`);
-
-  const text = statuteText(await readStatuteResponse(res));
+  const text = page.text;
   const esc = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const body = sliceSection(
     text,
@@ -880,6 +1014,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     text: body, text_chars: body.length, url,
     source: 'Oregon Legislature (oregonlegislature.gov), keyless',
     attribution: 'Oregon statutes are public record.',
+    served_from: page.cache.servedFrom, stale: page.cache.stale,
+    cache_age_sec: page.cache.cacheAgeSec, data_as_of: dataAsOf(page.cache),
   };
 }
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
